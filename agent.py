@@ -453,25 +453,34 @@ def resolve_name(name_input: str, roster: dict) -> dict | None:
 # ─────────────────────────────────────────────────────────────
 def parse_kickoff_body(body: str) -> dict:
     """
-    Parses the structured kickoff email body into a project dict.
-    Uses Claude to handle variations in formatting.
+    Parses project data from either:
+    - A JSON string passed from the Claude brain (already extracted)
+    - A raw email body (needs Claude to extract it)
     """
+    # If the body is already JSON from the Claude brain, use it directly
+    try:
+        data = json.loads(body)
+        if isinstance(data, dict) and any(k in data for k in ["project_name", "address", "client_name"]):
+            return data
+    except Exception:
+        pass
+
+    # Otherwise use Claude to extract from raw email body
     prompt = f"""
 You are parsing a project kickoff email for Baldovin Construction Co.
-Extract the following fields from the email body below and return ONLY valid JSON, no markdown.
+Extract the following fields and return ONLY valid JSON, no markdown, no preamble.
 Fields: project_name, address, client_name, client_email, client_phone, scope, estimated_value, notes.
-If a field is missing, use an empty string.
+If a field is missing use an empty string.
 
 Email body:
 {body}
 """
     raw = ask_claude(prompt)
     try:
-        # Strip any accidental markdown fences
         clean = raw.replace("```json", "").replace("```", "").strip()
         return json.loads(clean)
     except Exception:
-        log.warning("Claude could not parse kickoff body — using empty project.")
+        log.warning("Could not parse kickoff body — using empty project dict.")
         return {}
 
 # ─────────────────────────────────────────────────────────────
@@ -854,51 +863,272 @@ def check_schedule_updates(drive, sheets, whitelist: dict):
             log.info(f"Close date updated for {proj['Project ID']}: {close_date}")
 
 # ─────────────────────────────────────────────────────────────
+# SILENT ACTION LOG
+# Logs emails from whitelisted senders that couldn't be actioned.
+# Stored in memory for the session — future version can write to Sheet.
+# ─────────────────────────────────────────────────────────────
+_silent_log = []
+
+def log_silent(sender: str, subject: str, reason: str):
+    entry = {
+        "timestamp": datetime.now().isoformat(),
+        "sender":    sender,
+        "subject":   subject,
+        "reason":    reason,
+    }
+    _silent_log.append(entry)
+    log.info(f"Silent log entry: {sender} | {subject} | {reason}")
+
+# ─────────────────────────────────────────────────────────────
+# CLAUDE EMAIL BRAIN
+# Replaces rigid pattern matching with intelligent email routing.
+# Claude reads the full email, knows who the sender is, what
+# projects they're on, and decides what action to take.
+# ─────────────────────────────────────────────────────────────
+AGENT_SYSTEM_PROMPT = """
+You are the Baldovin Construction Co. project agent — an intelligent assistant 
+managing project communications for a second-generation family construction firm 
+based in Peoria, IL, expanding into TX, AZ, and FL.
+
+You operate within EOS/Traction principles. Every response you give is professional, 
+direct, warm, and helpful. You sign all replies as "— Baldovin Agent".
+
+YOUR CAPABILITIES:
+- Create new projects (triggers Drive folder creation and project registration)
+- Assign team members to projects by role (Designer, PM, Sub, Field Super)
+- Look up current project status, phase, and team assignments
+- Answer questions about projects the sender is assigned to
+- Guide team members through what you can help with
+- Generate status and closeout reports on request
+
+YOUR RULES:
+- You ONLY share information about projects the sender is assigned to
+- Leadership and Director roles can see all projects
+- Estimators, PMs, Designers, and Field see only their assigned projects
+- If a sender asks about a project they're not on, politely tell them you can't share that
+- If you need more information to complete a request, ask ONE question at a time conversationally
+- Never make up project data — only report what exists in the registry
+- If you cannot action something, respond with ACTION: NONE and a brief reason
+- If you can action something, respond with the action type first, then your reply
+
+RESPONSE FORMAT:
+Always respond in this exact JSON format so the agent can parse your decision:
+{
+  "action": "NEW_PROJECT" | "ASSIGN_DESIGNER" | "ASSIGN_PM" | "ASSIGN_SUB" | "ASSIGN_SUPER" | "WEEKLY_REPORT" | "STATUS_REPLY" | "CLARIFY" | "NONE",
+  "reply": "the email reply text to send to the user, or empty string if action is NONE",
+  "data": {
+    "project_name": "",
+    "project_id": "",
+    "assignee_name": "",
+    "address": "",
+    "client_name": "",
+    "client_email": "",
+    "client_phone": "",
+    "scope": "",
+    "estimated_value": "",
+    "notes": ""
+  }
+}
+
+Only include fields in data that are relevant to the action.
+If action is NONE, reply must be empty string "".
+If action is CLARIFY, reply contains the single clarifying question to ask.
+If action is STATUS_REPLY, reply contains the status information formatted clearly.
+"""
+
+def claude_process_email(
+    msg: dict,
+    person: dict,
+    assigned_projects: list,
+    all_projects: list,
+) -> dict:
+    """
+    Passes the email to Claude with full context.
+    Claude decides what action to take and what to reply.
+    Returns parsed JSON decision dict.
+    """
+    # Build project context scoped to sender's role
+    role = person.get("role", "")
+    is_leadership = role in ["Leadership", "Director Ops & BD", "Admin"]
+
+    if is_leadership:
+        visible_projects = all_projects
+    else:
+        visible_projects = assigned_projects
+
+    projects_summary = []
+    for p in visible_projects:
+        projects_summary.append({
+            "project_id":     p.get("Project ID", ""),
+            "project_name":   p.get("Project Name", ""),
+            "address":        p.get("Address", ""),
+            "client":         p.get("Client Name", ""),
+            "phase":          p.get("Current Phase", ""),
+            "estimator":      p.get("Estimator", ""),
+            "designer":       p.get("Designer", ""),
+            "pm":             p.get("PM Assigned", ""),
+            "folder":         p.get("Folder Location", ""),
+            "close_date":     p.get("Close Date", ""),
+            "active":         p.get("Active (Y/N)", ""),
+        })
+
+    user_prompt = f"""
+SENDER INFORMATION:
+Name: {person.get('name')}
+Email: {msg['sender_email']}
+Role: {person.get('role')}
+Active: {person.get('active')}
+
+SENDER'S VISIBLE PROJECTS:
+{json.dumps(projects_summary, indent=2)}
+
+TOTAL ACTIVE PROJECTS IN PORTFOLIO: {len(all_projects)}
+
+EMAIL RECEIVED:
+Subject: {msg['subject']}
+Body:
+{msg['body']}
+
+Based on this email, decide what action to take and what to reply.
+Remember: respond ONLY with valid JSON matching the format in your instructions.
+"""
+
+    raw = ask_claude(user_prompt, system=AGENT_SYSTEM_PROMPT)
+
+    try:
+        clean = raw.replace("```json", "").replace("```", "").strip()
+        return json.loads(clean)
+    except Exception as e:
+        log.error(f"Claude response parse error: {e} | Raw: {raw}")
+        return {"action": "NONE", "reply": "", "data": {}}
+
+
+def get_sender_projects(sender_email: str, all_projects: list, person: dict) -> list:
+    """Returns projects the sender is assigned to based on their role."""
+    role = person.get("role", "")
+    name = person.get("name", "").lower()
+
+    if role in ["Leadership", "Director Ops & BD", "Admin"]:
+        return all_projects
+
+    assigned = []
+    for p in all_projects:
+        assigned_fields = [
+            p.get("Estimator", "").lower(),
+            p.get("Designer", "").lower(),
+            p.get("PM Assigned", "").lower(),
+            p.get("Sub Coordinator", "").lower(),
+            p.get("Field Super", "").lower(),
+            p.get("Finance Contact", "").lower(),
+        ]
+        if any(name in field for field in assigned_fields):
+            assigned.append(p)
+    return assigned
+
+
+# ─────────────────────────────────────────────────────────────
 # MAIN EMAIL PROCESSOR
 # ─────────────────────────────────────────────────────────────
 def process_inbox(gmail, drive, sheets):
-    """Read unread emails and route to appropriate handler."""
-    whitelist = get_whitelist(sheets)
-    roster    = get_team_roster(sheets)
-    messages  = get_unread_messages(gmail)
+    """
+    Reads unread emails. Unknown senders are silently ignored.
+    Whitelisted senders get Claude-powered intelligent handling.
+    """
+    whitelist     = get_whitelist(sheets)
+    roster        = get_team_roster(sheets)
+    all_projects  = get_project_registry(sheets)
+    messages      = get_unread_messages(gmail)
+
+    log.info(f"Inbox check — {len(messages)} unread message(s) found.")
 
     for msg_ref in messages:
         try:
-            msg = get_message_detail(gmail, msg_ref["id"])
-            mark_as_read(gmail, msg_ref["id"])
+            msg    = get_message_detail(gmail, msg_ref["id"])
+            sender = msg["sender_email"]
             subject = msg["subject"]
-            sender  = msg["sender_email"]
-            log.info(f"Processing email from {sender} — Subject: {subject}")
 
-            # Route by subject pattern
-            if CMD_NEW_PROJECT.search(subject):
+            # ── WHITELIST GATE ──────────────────────────────
+            person = whitelist.get(sender.lower())
+            if not person or not person.get("active"):
+                # Unknown or inactive sender — silent. Leave unread.
+                log.info(f"Unknown/inactive sender: {sender} — ignored silently.")
+                continue
+
+            # Known sender — mark as read and process
+            mark_as_read(gmail, msg_ref["id"])
+            log.info(f"━━━ WHITELISTED EMAIL ━━━")
+            log.info(f"  From: {person['name']} ({person['role']})")
+            log.info(f"  Subject: {subject}")
+
+            # ── SCOPE PROJECTS TO SENDER ────────────────────
+            assigned_projects = get_sender_projects(sender, all_projects, person)
+
+            # ── HAND TO CLAUDE ──────────────────────────────
+            decision = claude_process_email(msg, person, assigned_projects, all_projects)
+            action   = decision.get("action", "NONE")
+            reply    = decision.get("reply", "")
+            data     = decision.get("data", {})
+
+            log.info(f"  Claude decision: {action}")
+
+            # ── ROUTE THE ACTION ────────────────────────────
+            if action == "NEW_PROJECT":
+                # Merge Claude-extracted data with msg for handler
+                msg["body"] = json.dumps(data) if data else msg["body"]
                 handle_new_project(msg, gmail, drive, sheets, whitelist, roster)
 
-            elif CMD_ASSIGN_DESIGNER.search(subject):
-                m = CMD_ASSIGN_DESIGNER.search(subject)
-                handle_assignment(msg, "ASSIGN DESIGNER", m.group(1), m.group(2),
-                                   gmail, sheets, whitelist, roster)
+            elif action == "ASSIGN_DESIGNER":
+                handle_assignment(
+                    msg, "ASSIGN DESIGNER",
+                    data.get("project_id", ""),
+                    data.get("assignee_name", ""),
+                    gmail, sheets, whitelist, roster
+                )
 
-            elif CMD_ASSIGN_PM.search(subject):
-                m = CMD_ASSIGN_PM.search(subject)
-                handle_assignment(msg, "ASSIGN PM", m.group(1), m.group(2),
-                                   gmail, sheets, whitelist, roster)
+            elif action == "ASSIGN_PM":
+                handle_assignment(
+                    msg, "ASSIGN PM",
+                    data.get("project_id", ""),
+                    data.get("assignee_name", ""),
+                    gmail, sheets, whitelist, roster
+                )
 
-            elif CMD_ASSIGN_SUB.search(subject):
-                m = CMD_ASSIGN_SUB.search(subject)
-                handle_assignment(msg, "ASSIGN SUB", m.group(1), m.group(2),
-                                   gmail, sheets, whitelist, roster)
+            elif action == "ASSIGN_SUB":
+                handle_assignment(
+                    msg, "ASSIGN SUB",
+                    data.get("project_id", ""),
+                    data.get("assignee_name", ""),
+                    gmail, sheets, whitelist, roster
+                )
 
-            elif CMD_ASSIGN_SUPER.search(subject):
-                m = CMD_ASSIGN_SUPER.search(subject)
-                handle_assignment(msg, "ASSIGN SUPER", m.group(1), m.group(2),
-                                   gmail, sheets, whitelist, roster)
+            elif action == "ASSIGN_SUPER":
+                handle_assignment(
+                    msg, "ASSIGN SUPER",
+                    data.get("project_id", ""),
+                    data.get("assignee_name", ""),
+                    gmail, sheets, whitelist, roster
+                )
 
-            elif CMD_WEEKLY_REPORT.search(subject):
+            elif action == "WEEKLY_REPORT":
                 handle_weekly_report(msg, gmail, sheets, whitelist)
 
+            elif action in ("STATUS_REPLY", "CLARIFY"):
+                # Claude already wrote the reply — just send it
+                if reply:
+                    send_email(
+                        gmail, sender,
+                        f"Re: {subject}",
+                        reply
+                    )
+                    log.info(f"  Reply sent: {action}")
+
+            elif action == "NONE":
+                # Can't action — log silently, no reply
+                log_silent(sender, subject, "Claude determined no actionable intent")
+
             else:
-                log.info(f"No matching command pattern for subject: {subject}")
+                log.warning(f"  Unknown action from Claude: {action}")
+                log_silent(sender, subject, f"Unknown Claude action: {action}")
 
         except Exception as e:
             log.error(f"Error processing message {msg_ref['id']}: {e}", exc_info=True)
